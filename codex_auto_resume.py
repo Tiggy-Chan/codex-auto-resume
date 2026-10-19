@@ -5,7 +5,8 @@ Copyright (c) 2026 Tiggy Chan. Released under the MIT License.
 
 Seamlessly monitors long-running Codex Goal sessions, detects usage limits and
 server reset timestamps (including unannounced Tibo quota refills), and natively
-resumes goals via macOS Accessibility without window popups or chat message pollution.
+resumes goals via direct app-server control socket or macOS Accessibility.
+100% silent, zero window popups, zero wallpaper clicks, zero chat message pollution.
 """
 
 import os
@@ -18,6 +19,9 @@ import datetime
 import argparse
 import subprocess
 import re
+import socket
+import struct
+import base64
 from pathlib import Path
 
 DEFAULT_CODEX_HOME = Path.home() / ".codex"
@@ -64,6 +68,7 @@ class CodexAutoResume:
     def __init__(self, thread_id=None, codex_home=None, log_file=None, interval=45, probe_interval=180):
         self.codex_home = Path(codex_home) if codex_home else DEFAULT_CODEX_HOME
         self.goals_db = self.codex_home / "goals_1.sqlite"
+        self.control_sock = self.codex_home / "app-server-control" / "app-server-control.sock"
         self.thread_id = thread_id
         self.log_file = log_file
         self.interval = interval
@@ -74,7 +79,6 @@ class CodexAutoResume:
     def _find_codex_bin(self):
         if DEFAULT_CODEX_CLI.exists():
             return str(DEFAULT_CODEX_CLI)
-        # Check PATH
         which_codex = subprocess.run(["which", "codex"], capture_output=True, text=True).stdout.strip()
         if which_codex:
             return which_codex
@@ -182,13 +186,108 @@ class CodexAutoResume:
         except Exception as e:
             return {"error": str(e), "is_limited": True}
 
+    def _make_ws_frame(self, payload: bytes, opcode=1):
+        frame = bytearray()
+        frame.append(0x80 | (opcode & 0x0f))
+        mask_key = os.urandom(4)
+        length = len(payload)
+        if length <= 125:
+            frame.append(0x80 | length)
+        elif length <= 65535:
+            frame.append(0x80 | 126)
+            frame.extend(struct.pack("!H", length))
+        else:
+            frame.append(0x80 | 127)
+            frame.extend(struct.pack("!Q", length))
+        frame.extend(mask_key)
+        masked = bytearray(payload)
+        for i in range(len(masked)):
+            masked[i] ^= mask_key[i % 4]
+        frame.extend(masked)
+        return bytes(frame)
+
+    def _read_ws_frame(self, s):
+        hdr = s.recv(2)
+        if not hdr: return None
+        b1, b2 = hdr[0], hdr[1]
+        opcode = b1 & 0x0f
+        masked = bool(b2 & 0x80)
+        payload_len = b2 & 0x7f
+        if payload_len == 126:
+            payload_len = struct.unpack("!H", s.recv(2))[0]
+        elif payload_len == 127:
+            payload_len = struct.unpack("!Q", s.recv(8))[0]
+        mask_key = s.recv(4) if masked else None
+        data = bytearray()
+        while len(data) < payload_len:
+            chunk = s.recv(min(4096, payload_len - len(data)))
+            if not chunk: break
+            data.extend(chunk)
+        if masked:
+            for i in range(len(data)):
+                data[i] ^= mask_key[i % 4]
+        return bytes(data)
+
+    def resume_goal_via_socket(self):
+        """Primary method: Direct JSON-RPC thread/goal/set via control socket. 100% headless."""
+        if not self.control_sock.exists():
+            return False
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect(str(self.control_sock))
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            handshake = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: localhost\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            s.sendall(handshake.encode("utf-8"))
+            resp = s.recv(4096)
+            if b"101 Switching Protocols" not in resp:
+                s.close()
+                return False
+
+            # initialize
+            s.sendall(self._make_ws_frame(json.dumps({
+                "id": "1", "method": "initialize", "params": {"clientInfo": {"name": "codex-auto-resume", "version": "1.0.0"}}
+            }).encode("utf-8")))
+            s.sendall(self._make_ws_frame(json.dumps({"method": "initialized"}).encode("utf-8")))
+
+            # thread/goal/set
+            s.sendall(self._make_ws_frame(json.dumps({
+                "id": "2", "method": "thread/goal/set", "params": {"threadId": self.thread_id, "status": "active"}
+            }).encode("utf-8")))
+
+            for _ in range(5):
+                raw = self._read_ws_frame(s)
+                if not raw: break
+                msg = json.loads(raw.decode("utf-8"))
+                if msg.get("id") == "2":
+                    if "result" in msg:
+                        s.close()
+                        self.log("Successfully resumed goal via app-server control socket (thread/goal/set -> active).")
+                        return True
+            s.close()
+            return False
+        except Exception as e:
+            self.log(f"Socket resume attempt notice: {e}")
+            return False
+
     def click_resume_goal(self):
-        """Native Accessibility click on '恢复目标' / 'Resume goal'."""
+        """Resume goal action: Tries direct socket first, then native Accessibility UI click as fallback."""
+        if self.resume_goal_via_socket():
+            return True
+
+        # Fallback to AppleScript UI accessibility
         try:
             res = subprocess.run(["osascript", "-e", APPLESCRIPT_CLICK], capture_output=True, text=True)
             out = res.stdout.strip()
             if "SUCCESS" in out:
-                self.log(f"Successfully clicked '恢复目标' (Resume Goal) via native Accessibility ({out}).")
+                self.log(f"Successfully triggered '恢复目标' via Accessibility fallback ({out}).")
                 return True
             else:
                 self.log(f"Click notice: {out}")
@@ -291,7 +390,7 @@ def main():
     parser.add_argument("-p", "--probe-interval", type=int, default=180, help="Tibo quota probe interval in seconds (default: 180)")
     parser.add_argument("-l", "--log", help="Path to log file (default: stdout only)")
     parser.add_argument("--status", action="store_true", help="Print current goal status and quota state as JSON, then exit")
-    parser.add_argument("--click-only", action="store_true", help="Perform native UI click once immediately, then exit")
+    parser.add_argument("--click-only", action="store_true", help="Perform native resume action once immediately, then exit")
     args = parser.parse_args()
 
     supervisor = CodexAutoResume(
