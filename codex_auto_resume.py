@@ -31,34 +31,21 @@ DEFAULT_CODEX_CLI = DEFAULT_CHATGPT_APP / "Contents/Resources/codex-cli/bin/code
 APPLESCRIPT_CLICK = """
 tell application "System Events"
     tell process "ChatGPT"
-        -- Search through the window structure for the "恢复目标" / "Resume goal" action
-        try
-            set s to scroll area 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group "ChatGPT" of window "ChatGPT"
-            set mainElem to UI element 1 of s
-            set targetGroup to group 2 of group 1 of group 1 of group 3 of group 1 of group 2 of group "Conversation" of group 1 of group 2 of group 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group 2 of group 4 of group 2 of group 1 of group 1 of group 1 of mainElem
-            repeat with b in (every button of targetGroup)
-                set n to (name of b as text)
-                set d to (description of b as text)
-                if n contains "恢复" or n contains "Resume" or d contains "恢复" or d contains "Resume" then
-                    click b
-                    return "SUCCESS_TARGET_GROUP"
+        if (count of windows) is 0 then return "NO_WINDOW"
+        -- Search the live accessibility tree instead of using a stale hierarchy.
+        repeat with itemRef in (entire contents of window 1)
+            try
+                set elem to contents of itemRef
+                if (role of elem as text) is "AXButton" then
+                    set n to name of elem as text
+                    set d to description of elem as text
+                    if n is "恢复目标" or d is "恢复目标" or n is "Resume goal" or d is "Resume goal" then
+                        perform action "AXPress" of elem
+                        return "SUCCESS_AXPRESS"
+                    end if
                 end if
-            end repeat
-        end try
-
-        -- Fallback: deep search in Conversation container
-        try
-            set conv to group "Conversation" of group 1 of group 2 of group 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group 2 of group 4 of group 2 of group 1 of group 1 of group 1 of UI element 1 of scroll area 1 of group 1 of group 1 of group 1 of group 1 of group 1 of group "ChatGPT" of window "ChatGPT"
-            repeat with b in (every button of (entire contents of conv))
-                set n to (name of b as text)
-                set d to (description of b as text)
-                if n contains "恢复" or n contains "Resume" or d contains "恢复" or d contains "Resume" then
-                    click b
-                    return "SUCCESS_DEEP_CONV"
-                end if
-            end repeat
-        end try
-
+            end try
+        end repeat
         return "BUTTON_NOT_FOUND"
     end tell
 end tell
