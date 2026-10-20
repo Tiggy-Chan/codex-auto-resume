@@ -337,17 +337,22 @@ class CodexAutoResume:
             tokens = info["tokens_used"]
             time_used = info["time_used_seconds"]
 
-            # 1. Goal is actively working
-            if status == "active":
+            # A goal marked active can still be idle after the previous turn failed on quota.
+            # Keep probing the live backend so a stale local active flag cannot suppress resume.
+            resets_at = self.get_latest_resets_at()
+            remaining = (resets_at - now_ts) if resets_at else 999999
+
+            if status == "active" and remaining > 5:
                 if iteration % 4 == 1:
                     self.log(f"[ACTIVE] Goal is coding actively. Tokens: {tokens:,}, Time: {time_used}s. Silent monitoring...")
                 time.sleep(self.interval)
                 continue
 
-            # 2. Goal is usage_limited or paused
-            resets_at = self.get_latest_resets_at()
-            remaining = (resets_at - now_ts) if resets_at else 999999
+            # A goal marked active with an expired reset timestamp is stale; test the backend.
+            if status == "active":
+                self.log("[STALE ACTIVE] Goal is marked active but its quota window has expired; probing before resuming.")
 
+            # Goal is usage_limited, paused, or stale-active after a reset.
             # A. Scheduled reset time reached
             if resets_at and remaining <= 5:
                 reset_str = datetime.datetime.fromtimestamp(resets_at).strftime("%Y-%m-%d %H:%M:%S")
