@@ -32,7 +32,7 @@ APPLESCRIPT_CLICK = """
 tell application "System Events"
     tell process "ChatGPT"
         if (count of windows) is 0 then return "NO_WINDOW"
-        -- Search the live accessibility tree instead of using a stale hierarchy.
+        -- Search the live accessibility tree. This is the same UI action the user performs.
         repeat with itemRef in (entire contents of window 1)
             try
                 set elem to contents of itemRef
@@ -249,21 +249,38 @@ class CodexAutoResume:
             }).encode("utf-8")))
             s.sendall(self._make_ws_frame(json.dumps({"method": "initialized"}).encode("utf-8")))
 
-            # This is the exact server request issued by the UI's Resume goal callback.
-            # The app server creates the goal-triggered continuation itself when quota allows;
-            # do not send a synthetic turn/start or a user message here.
+            # The UI first refreshes thread attachments, then changes the goal state.
+            # Matching that order is important: a bare goal mutation can update the badge
+            # without entering the same continuation path as the button.
             s.sendall(self._make_ws_frame(json.dumps({
-                "id": "2", "method": "thread/goal/set", "params": {"threadId": self.thread_id, "status": "active"}
+                "id": "2", "method": "thread/attachment/list",
+                "params": {"threadId": self.thread_id}
             }).encode("utf-8")))
-
+            attachment_response = None
             for _ in range(10):
                 raw = self._read_ws_frame(s)
                 if not raw: break
                 msg = json.loads(raw.decode("utf-8"))
                 if msg.get("id") == "2":
+                    attachment_response = msg
+                    break
+            if not attachment_response or "result" not in attachment_response:
+                s.close()
+                self.log(f"Attachment refresh rejected: {attachment_response}")
+                return False
+
+            s.sendall(self._make_ws_frame(json.dumps({
+                "id": "3", "method": "thread/goal/set",
+                "params": {"threadId": self.thread_id, "status": "active"}
+            }).encode("utf-8")))
+            for _ in range(20):
+                raw = self._read_ws_frame(s)
+                if not raw: break
+                msg = json.loads(raw.decode("utf-8"))
+                if msg.get("id") == "3":
                     s.close()
                     if "result" in msg:
-                        self.log("App-server accepted the same thread/goal/set request used by Resume goal.")
+                        self.log("Resume sequence accepted: thread/attachment/list -> thread/goal/set.")
                         return True
                     self.log(f"Resume goal request rejected: {msg.get('error', msg)}")
                     return False
