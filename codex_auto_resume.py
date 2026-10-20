@@ -262,52 +262,23 @@ class CodexAutoResume:
             }).encode("utf-8")))
             s.sendall(self._make_ws_frame(json.dumps({"method": "initialized"}).encode("utf-8")))
 
-            # The UI does two things: set the goal active, then start a goal-triggered turn.
-            # A bare thread/goal/set only changes the badge and is not the full button behavior.
+            # This is the exact server request issued by the UI's Resume goal callback.
+            # The app server creates the goal-triggered continuation itself when quota allows;
+            # do not send a synthetic turn/start or a user message here.
             s.sendall(self._make_ws_frame(json.dumps({
                 "id": "2", "method": "thread/goal/set", "params": {"threadId": self.thread_id, "status": "active"}
             }).encode("utf-8")))
 
-            goal_response = None
             for _ in range(10):
                 raw = self._read_ws_frame(s)
                 if not raw: break
                 msg = json.loads(raw.decode("utf-8"))
                 if msg.get("id") == "2":
-                    goal_response = msg
-                    break
-            if not goal_response or "result" not in goal_response:
-                s.close()
-                return False
-
-            # This is the internal context the UI creates for Resume goal; it is not a user chat message.
-            s.sendall(self._make_ws_frame(json.dumps({
-                "id": "3",
-                "method": "turn/start",
-                "params": {
-                    "threadId": self.thread_id,
-                    "input": [],
-                    "cwd": None,
-                    "model": None,
-                    "effort": "minimal",
-                    "summary": "none",
-                    "approvalPolicy": None,
-                    "approvalsReviewer": None,
-                    "sandboxPolicy": None,
-                    "turnTrigger": "goal"
-                }
-            }).encode("utf-8")))
-
-            for _ in range(20):
-                raw = self._read_ws_frame(s)
-                if not raw: break
-                msg = json.loads(raw.decode("utf-8"))
-                if msg.get("id") == "3":
                     s.close()
                     if "result" in msg:
-                        self.log("Successfully started native goal continuation via app-server (turn/start, trigger=goal).")
+                        self.log("App-server accepted the same thread/goal/set request used by Resume goal.")
                         return True
-                    self.log(f"Goal continuation rejected: {msg.get('error', msg)}")
+                    self.log(f"Resume goal request rejected: {msg.get('error', msg)}")
                     return False
             s.close()
             return False
